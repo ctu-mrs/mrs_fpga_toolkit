@@ -44,20 +44,32 @@ SPI_CR_TRANS_INHIBIT = 0x00000100
 SPI_CR_IDLE = SPI_CR_ENABLE | SPI_CR_MASTER | SPI_CR_MANUAL_SS | SPI_CR_TRANS_INHIBIT
 SPI_CR_RUN = SPI_CR_ENABLE | SPI_CR_MASTER | SPI_CR_MANUAL_SS
 SPI_INTR_TX_EMPTY = 0x00000004
+SPI_INTR_COMMAND_ERROR = 0x00002000
 SPI_SR_RX_EMPTY = 0x00000001
+SPI_SR_TX_EMPTY = 0x00000004
+SPI_SR_COMMAND_ERROR = 0x00000400
 
 SPI_FIFO_DEPTH = 256
 SPI_ADDRESS_BYTES = 3
-SPI_MAX_READ = SPI_FIFO_DEPTH - 1 - SPI_ADDRESS_BYTES
 
 CMD_READ_ID = 0x9F
 CMD_READ_STATUS = 0x05
 CMD_WRITE_ENABLE = 0x06
 CMD_READ = 0x03
+CMD_READ_4BYTE = 0x13
 CMD_PAGE_PROGRAM = 0x02
+CMD_PAGE_PROGRAM_4BYTE = 0x12
 CMD_ERASE_BLOCK = 0xD8
+CMD_ERASE_BLOCK_4BYTE = 0xDC
+CMD_RELEASE_POWER_DOWN = 0xAB
+CMD_MODE_BIT_RESET = 0xFF
+CMD_SPANSION_RESET = 0xF0
+CMD_RESET_QUAD_PROTOCOL = 0xF5
+CMD_RESET_ENABLE = 0x66
+CMD_RESET_MEMORY = 0x99
 STATUS_WIP = 0x01
 STATUS_WEL = 0x02
+FLASH_RESET_RECOVERY = 0.001
 
 # AXI HWICAP v3.0 register map (AMD PG134 / standalone XHwIcap driver).
 ICAP_WF = 0x100
@@ -88,6 +100,10 @@ class FlashProfile:
     page_size: int
     block_protect_mask: int
     operation_error_mask: int
+    address_bytes: int = SPI_ADDRESS_BYTES
+    read_command: int = CMD_READ
+    program_command: int = CMD_PAGE_PROGRAM
+    erase_command: int = CMD_ERASE_BLOCK
 
 
 FLASH_PROFILES = (
@@ -118,11 +134,37 @@ FLASH_PROFILES = (
         0x3C,
         0x00,
     ),
+    FlashProfile(
+        "Micron MT25QL01GBBB8E12-0SIT",
+        bytes.fromhex("20 ba 21"),
+        128 * 1024 * 1024,
+        64 * 1024,
+        256,
+        0x5C,
+        0x00,
+        address_bytes=4,
+        read_command=CMD_READ_4BYTE,
+        program_command=CMD_PAGE_PROGRAM_4BYTE,
+        erase_command=CMD_ERASE_BLOCK_4BYTE,
+    ),
 )
 
 
 class FlashError(RuntimeError):
     """An actionable flash, image, or controller error."""
+
+
+class SpiCommandError(FlashError):
+    """The synthesized dual/quad controller rejected an opcode."""
+
+    def __init__(self, opcode: int, state: dict[str, int]) -> None:
+        self.opcode = opcode
+        self.state = state
+        super().__init__(
+            f"AXI Quad SPI rejected opcode 0x{opcode:02x}; the synthesized "
+            "controller command profile does not support it "
+            f"({AxiQuadSpi.format_state(state)})"
+        )
 
 
 def require_root() -> None:
@@ -199,10 +241,10 @@ class AxiQuadSpi(MappedRegisters):
 
     def __enter__(self) -> "AxiQuadSpi":
         super().__enter__()
-        # When C_USE_STARTUP=1, AMD's driver sends this dummy transaction
-        # before the first software reset so STARTUPE2 begins forwarding clock.
+        # With C_USE_STARTUP=1, clock STARTUP before the first software reset.
+        # This transaction follows the AMD driver workaround exactly, including
+        # selecting the flash before loading the transmit FIFO.
         self.prime_startup_clock()
-        self.reset()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -229,19 +271,50 @@ class AxiQuadSpi(MappedRegisters):
             self.write32(SPI_IISR, pending)
 
     def prime_startup_clock(self) -> None:
-        control = self.read32(SPI_CR)
-        control |= (
-            SPI_CR_TX_FIFO_RESET | SPI_CR_RX_FIFO_RESET | SPI_CR_ENABLE | SPI_CR_MASTER
+        self.write32(
+            SPI_CR,
+            SPI_CR_IDLE | SPI_CR_TX_FIFO_RESET | SPI_CR_RX_FIFO_RESET,
         )
-        self.write32(SPI_CR, control)
-        for value in (CMD_READ_ID, 0x00, 0x00):
-            self.write32(SPI_DTR, value)
-        self.write32(SPI_CR, self.read32(SPI_CR) & ~SPI_CR_TRANS_INHIBIT)
-        self.write32(SPI_CR, self.read32(SPI_CR) | SPI_CR_TRANS_INHIBIT)
-        for _ in range(2):
-            if self.read32(SPI_SR) & SPI_SR_RX_EMPTY:
-                break
-            self.read32(SPI_DRR)
+        self.write32(SPI_CR, SPI_CR_IDLE)
+        self.write32(SPI_SSR, 0xFFFFFFFF)
+        pending = self.read32(SPI_IISR)
+        if pending:
+            self.write32(SPI_IISR, pending)
+
+        try:
+            self.write32(SPI_SSR, 0x00000000)
+            for value in (CMD_READ_ID, 0x00, 0x00):
+                self.write32(SPI_DTR, value)
+            self.write32(SPI_CR, SPI_CR_RUN)
+
+            deadline = time.monotonic() + self.timeout
+            while True:
+                status = self.read32(SPI_SR)
+                pending = self.read32(SPI_IISR)
+                if status & SPI_SR_COMMAND_ERROR or pending & SPI_INTR_COMMAND_ERROR:
+                    state = self.register_state()
+                    raise FlashError(
+                        "AXI Quad SPI rejected its STARTUP clock transaction "
+                        f"({self.format_state(state)})"
+                    )
+                if status & SPI_SR_TX_EMPTY:
+                    break
+                if time.monotonic() >= deadline:
+                    state = self.register_state()
+                    raise FlashError(
+                        "timeout priming the AXI Quad SPI STARTUP clock "
+                        f"({self.format_state(state)})"
+                    )
+
+            self.write32(SPI_CR, SPI_CR_IDLE)
+            for _ in range(SPI_FIFO_DEPTH):
+                if self.read32(SPI_SR) & SPI_SR_RX_EMPTY:
+                    break
+                self.read32(SPI_DRR)
+        finally:
+            self.write32(SPI_CR, SPI_CR_IDLE)
+            self.write32(SPI_SSR, 0xFFFFFFFF)
+            self.reset()
 
     def register_state(self) -> dict[str, int]:
         return {
@@ -278,7 +351,17 @@ class AxiQuadSpi(MappedRegisters):
         self.write32(SPI_CR, SPI_CR_RUN)
 
         deadline = time.monotonic() + self.timeout
-        while not self.read32(SPI_IISR) & SPI_INTR_TX_EMPTY:
+        while True:
+            pending = self.read32(SPI_IISR)
+            if pending & SPI_INTR_COMMAND_ERROR:
+                self.write32(SPI_CR, SPI_CR_IDLE)
+                state = self.register_state()
+                self.last_transfer_state = state
+                self.write32(SPI_SSR, 0xFFFFFFFF)
+                self.write32(SPI_IISR, pending)
+                raise SpiCommandError(transmit[0], state)
+            if pending & SPI_INTR_TX_EMPTY:
+                break
             if time.monotonic() >= deadline:
                 self.write32(SPI_CR, SPI_CR_IDLE)
                 self.write32(SPI_SSR, 0xFFFFFFFF)
@@ -299,19 +382,16 @@ class AxiQuadSpi(MappedRegisters):
 
 
 class SpiNor:
-    """24-bit-address SPI-NOR operations for auto-detected board flashes."""
+    """Profile-driven SPI-NOR operations for auto-detected board flashes."""
 
     def __init__(self, spi: AxiQuadSpi) -> None:
         self.spi = spi
+        self.rejected_recovery_commands: list[int] = []
         self.jedec_id = self.read_id()
-        self.profile = next(
-            (
-                profile
-                for profile in FLASH_PROFILES
-                if self.jedec_id.startswith(profile.jedec_prefix)
-            ),
-            None,
-        )
+        self.profile = self.match_profile(self.jedec_id)
+        if self.profile is None and self.is_idle_bus_id(self.jedec_id):
+            self.recover_serial_mode()
+            self.profile = self.match_profile(self.jedec_id)
         if self.profile is None:
             supported = ", ".join(
                 f"{profile.name} ({profile.jedec_prefix.hex(' ')})"
@@ -323,26 +403,106 @@ class SpiNor:
                 if state
                 else ""
             )
+            if self.is_idle_bus_id(self.jedec_id):
+                level = "high" if self.jedec_id[0] == 0xFF else "low"
+                rejected = ""
+                if self.rejected_recovery_commands:
+                    opcodes = ", ".join(
+                        f"0x{opcode:02x}" for opcode in self.rejected_recovery_commands
+                    )
+                    rejected = (
+                        f" The controller rejected recovery opcode(s) {opcodes}; "
+                        "its synthesized flash-vendor command profile does not "
+                        "match all recovery commands required by the installed "
+                        "device."
+                    )
+                raise FlashError(
+                    f"SPI flash did not respond; JEDEC ID remained "
+                    f"{self.jedec_id.hex(' ')} (DQ1 sampled {level}) after "
+                    f"STARTUP handoff and safe reset/wake recovery{diagnostic}. "
+                    f"{rejected} Cold-power-cycle the board if the flash was "
+                    "previously left in 4-4-4 QPI mode; the AXI Quad SPI core "
+                    "cannot issue a 4-bit command phase. "
+                    f"Supported devices: {supported}"
+                )
             raise FlashError(
                 f"unsupported flash JEDEC ID {self.jedec_id.hex(' ')}"
                 f"{diagnostic}; supported devices: {supported}"
             )
         self.physical_capacity = self.profile.physical_capacity
-        self.capacity = min(self.physical_capacity, 1 << 24)
+        self.capacity = min(
+            self.physical_capacity,
+            1 << (8 * self.profile.address_bytes),
+        )
         self.erase_size = self.profile.erase_size
         self.page_size = self.profile.page_size
 
     def read_id(self) -> bytes:
         return self.spi.transfer(bytes([CMD_READ_ID]) + bytes(6))[1:]
 
+    @staticmethod
+    def match_profile(jedec_id: bytes) -> FlashProfile | None:
+        return next(
+            (
+                profile
+                for profile in FLASH_PROFILES
+                if jedec_id.startswith(profile.jedec_prefix)
+            ),
+            None,
+        )
+
+    @staticmethod
+    def is_idle_bus_id(jedec_id: bytes) -> bool:
+        return bool(jedec_id) and len(set(jedec_id)) == 1 and jedec_id[0] in (0, 0xFF)
+
+    def recover_serial_mode(self) -> None:
+        """Apply only non-destructive commands accepted by the built core."""
+        # ABh releases Micron/ISSI devices from deep power-down and is also a
+        # harmless electronic-signature command on S25FL-S.
+        self.try_recovery_command(CMD_RELEASE_POWER_DOWN)
+        time.sleep(FLASH_RESET_RECOVERY)
+        self.jedec_id = self.read_id()
+        if self.match_profile(self.jedec_id) is not None:
+            return
+
+        # Micron uses F5h to reset quad protocol and 66h/99h for software reset.
+        # A vendor-mismatched dual/quad AXI core can reject these before they
+        # reach the pins, so unsupported commands are recorded and skipped.
+        self.try_recovery_command(CMD_RESET_QUAD_PROTOCOL)
+        reset_enabled = self.try_recovery_command(CMD_RESET_ENABLE)
+        if reset_enabled:
+            self.try_recovery_command(CMD_RESET_MEMORY)
+        time.sleep(FLASH_RESET_RECOVERY)
+        self.jedec_id = self.read_id()
+        if self.match_profile(self.jedec_id) is not None:
+            return
+
+        # S25FL-S uses FFh followed by F0h to leave enhanced modes and reset.
+        mode_reset = self.try_recovery_command(CMD_MODE_BIT_RESET)
+        if mode_reset:
+            self.try_recovery_command(CMD_SPANSION_RESET)
+        time.sleep(FLASH_RESET_RECOVERY)
+        self.jedec_id = self.read_id()
+
+    def try_recovery_command(self, opcode: int) -> bool:
+        try:
+            self.spi.transfer(bytes([opcode]))
+        except SpiCommandError:
+            self.rejected_recovery_commands.append(opcode)
+            return False
+        return True
+
     def read_status(self) -> int:
         return self.spi.transfer(bytes([CMD_READ_STATUS, 0]))[1]
 
-    @staticmethod
-    def address(value: int) -> bytes:
-        if not 0 <= value <= 0xFFFFFF:
-            raise ValueError(f"address outside 24-bit flash range: 0x{value:x}")
-        return value.to_bytes(SPI_ADDRESS_BYTES, "big")
+    def address(self, value: int) -> bytes:
+        maximum = (1 << (8 * self.profile.address_bytes)) - 1
+        if not 0 <= value <= maximum:
+            raise ValueError(
+                f"address outside {self.profile.address_bytes * 8}-bit flash "
+                f"range: 0x{value:x}"
+            )
+        return value.to_bytes(self.profile.address_bytes, "big")
 
     def check_range(self, address: int, length: int) -> None:
         if address < 0 or length < 0 or address + length > self.capacity:
@@ -354,9 +514,12 @@ class SpiNor:
     def read(self, address: int, length: int) -> bytes:
         self.check_range(address, length)
         output = bytearray()
+        maximum_data = SPI_FIFO_DEPTH - 1 - self.profile.address_bytes
         while len(output) < length:
-            chunk = min(SPI_MAX_READ, length - len(output))
-            command = bytes([CMD_READ]) + self.address(address + len(output))
+            chunk = min(maximum_data, length - len(output))
+            command = bytes([self.profile.read_command]) + self.address(
+                address + len(output)
+            )
             response = self.spi.transfer(command + bytes(chunk))
             output.extend(response[len(command) :])
         return bytes(output)
@@ -395,7 +558,7 @@ class SpiNor:
         if address % self.erase_size:
             raise ValueError(f"erase address must be {self.erase_size}-byte aligned")
         self.write_enable()
-        self.spi.transfer(bytes([CMD_ERASE_BLOCK]) + self.address(address))
+        self.spi.transfer(bytes([self.profile.erase_command]) + self.address(address))
         self.wait_ready(
             180.0,
             f"{self.erase_size // 1024}-KiB erase at 0x{address:06x}",
@@ -404,13 +567,20 @@ class SpiNor:
     def program(self, address: int, data: bytes) -> None:
         self.check_range(address, len(data))
         offset = 0
+        maximum_data = SPI_FIFO_DEPTH - 1 - self.profile.address_bytes
         while offset < len(data):
             current = address + offset
             page_remaining = self.page_size - current % self.page_size
-            chunk_size = min(SPI_MAX_READ, page_remaining, len(data) - offset)
+            chunk_size = min(
+                maximum_data,
+                page_remaining,
+                len(data) - offset,
+            )
             chunk = data[offset : offset + chunk_size]
             self.write_enable()
-            self.spi.transfer(bytes([CMD_PAGE_PROGRAM]) + self.address(current) + chunk)
+            self.spi.transfer(
+                bytes([self.profile.program_command]) + self.address(current) + chunk
+            )
             self.wait_ready(
                 5.0,
                 f"page program at 0x{current:06x}",
@@ -625,7 +795,7 @@ def display_flash(record: dict[str, object]) -> None:
     print(f"JEDEC ID:        {record['jedec_id']}")
     print(f"flash:           {record['profile']}")
     print(f"physical size:   {int(record['physical_capacity']) // 1048576} MiB")
-    print(f"24-bit window:   {int(record['accessible_capacity']) // 1048576} MiB")
+    print(f"accessible size: {int(record['accessible_capacity']) // 1048576} MiB")
     print(f"erase block:     {int(record['erase_size']) // 1024} KiB")
     print(f"program page:    {record['page_size']} bytes")
     print(f"status:          0x{int(record['status']):02x}")
