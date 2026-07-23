@@ -115,15 +115,34 @@ fi
     find . -type f ! -path './DEBIAN/*' -print0 | xargs -0 md5sum > ./DEBIAN/md5sums ;
 ) ;
 
+
+# create pre-installation package script
+cat > "$PACKAGE_ROOT/DEBIAN/preinst" <<EOF
+#!/bin/sh
+set -e
+
+echo "Removing xdma kernel module..."
+sudo rmmod xdma || true
+
+exit 0
+EOF
+chmod +x "$PACKAGE_ROOT/DEBIAN/preinst" ;
+
 # create post-installation package script
 cat > "$PACKAGE_ROOT/DEBIAN/postinst" <<EOF
 #!/bin/sh
 set -e
 
+echo "Installing xdma DKMS..."
 dkms add -m xdma -v $XDMA_VERSION
 dkms build -m xdma -v $XDMA_VERSION
 dkms install -m xdma -v $XDMA_VERSION
 
+echo "Loading xdma kernel module..."
+depmod -a
+modprobe xdma
+
+echo "Reloading udev rules..."
 udevadm control --reload-rules
 udevadm trigger
 
@@ -137,6 +156,9 @@ cat > "$PACKAGE_ROOT/DEBIAN/prerm" <<EOF
 set -e
 
 if [ "\$1" = "remove" ] || [ "\$1" = "deconfigure" ]; then
+	echo "Removing xdma kernel module..."
+	sudo rmmod xdma || true
+	echo "Removing xdma DKMS..."
     dkms remove -m xdma -v $XDMA_VERSION --all
 fi
 
@@ -150,9 +172,12 @@ cat > "$PACKAGE_ROOT/DEBIAN/postrm" <<EOF
 set -e
 
 if [ "\$1" = "purge" ]; then
+	echo "Removing xdma configuration files..."
     rm -f /etc/modules-load.d/xdma.conf || true
+    depmod -a
 fi
 
+echo "Reloading udev rules..."
 udevadm control --reload-rules
 udevadm trigger
 
