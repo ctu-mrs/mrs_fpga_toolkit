@@ -29,7 +29,6 @@ PACKAGE_FILENAME=$PACKAGE_NAME"_"$XDMA_VERSION"_"$ARCH".deb" ;
 # package metadata
 PACKAGE_MAINTAINER="Vojtech Vrba <vrba.vojtech@fel.cvut.cz>" ;
 PACKAGE_DEPENDS="linux-headers-generic, dkms, udev, build-essential" ;
-PACKAGE_PROVIDES="${PACKAGE_NAME} (>= $XDMA_VERSION)" ;
 
 ###################################
 ###  CONFIGURATION SECTION END  ###
@@ -102,7 +101,6 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: $PACKAGE_MAINTAINER
 Depends: $PACKAGE_DEPENDS
-Provides: $PACKAGE_PROVIDES
 Description: $PACKAGE_DESCRIPTION
 EOT
 
