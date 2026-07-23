@@ -80,18 +80,6 @@ chmod 644 $PACKAGE_ROOT/etc/udev/rules.d/60-xdma.rules ;
 # remove the repo dir
 rm -rf dma_ip_drivers ;
 
-# enable experimental mode and disable all plugins in the packaged systemd unit
-BLUETOOTH_SERVICE="$PACKAGE_ROOT/usr/lib/systemd/system/bluetooth.service" ;
-if [ ! -f "$BLUETOOTH_SERVICE" ] ; then
-    BLUETOOTH_SERVICE="$PACKAGE_ROOT/lib/systemd/system/bluetooth.service" ;
-fi
-if [ -f "$BLUETOOTH_SERVICE" ] ; then
-    sed -Ei '/^[[:space:]]*ExecStart=/ {
-        /(^|[[:space:]])-E([[:space:]]|$)/! s#$# -E#
-        /(^|[[:space:]])-P[[:space:]]+\*([[:space:]]|$)/! s#$# -P *#
-    }' "$BLUETOOTH_SERVICE" ;
-fi
-
 # create package control file
 cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOT
 Package: $PACKAGE_NAME
@@ -122,7 +110,7 @@ cat > "$PACKAGE_ROOT/DEBIAN/preinst" <<EOF
 set -e
 
 echo "Removing xdma kernel module..."
-sudo rmmod xdma || true
+sudo rmmod xdma 2>/dev/null || true
 
 exit 0
 EOF
@@ -157,7 +145,7 @@ set -e
 
 if [ "\$1" = "remove" ] || [ "\$1" = "deconfigure" ]; then
 	echo "Removing xdma kernel module..."
-	sudo rmmod xdma || true
+	sudo rmmod xdma 2>/dev/null || true
 	echo "Removing xdma DKMS..."
     dkms remove -m xdma -v $XDMA_VERSION --all
 fi
