@@ -48,6 +48,8 @@ SPI_INTR_COMMAND_ERROR = 0x00002000
 SPI_SR_RX_EMPTY = 0x00000001
 SPI_SR_TX_EMPTY = 0x00000004
 SPI_SR_COMMAND_ERROR = 0x00000400
+SPI_SSR_DESELECT_ALL = 0xFFFFFFFF
+SPI_SSR_SELECT_FLASH = 0xFFFFFFFE
 
 SPI_FIFO_DEPTH = 256
 SPI_ADDRESS_BYTES = 3
@@ -67,9 +69,19 @@ CMD_SPANSION_RESET = 0xF0
 CMD_RESET_QUAD_PROTOCOL = 0xF5
 CMD_RESET_ENABLE = 0x66
 CMD_RESET_MEMORY = 0x99
+CMD_READ_NONVOLATILE_CONFIG = 0xB5
+CMD_WRITE_NONVOLATILE_CONFIG = 0xB1
 STATUS_WIP = 0x01
 STATUS_WEL = 0x02
 FLASH_RESET_RECOVERY = 0.001
+
+# Micron MT25Q NVCR fields which must be disabled/set to their conventional
+# power-on values for an Artix-7 Master-SPI boot:
+#   [11:9] XIP disabled, [5] DTR disabled, [4] RESET#/HOLD# enabled,
+#   [3:2] 4-4-4/2-2-2 command protocols disabled,
+#   [1] lowest 128-Mbit segment, [0] three-byte command addressing.
+# Dummy-cycle and output-driver fields are deliberately preserved.
+MICRON_NVCR_BOOT_SAFE_MASK = 0x0E3F
 
 # AXI HWICAP v3.0 register map (AMD PG134 / standalone XHwIcap driver).
 ICAP_WF = 0x100
@@ -117,27 +129,9 @@ FLASH_PROFILES = (
         0x60,
     ),
     FlashProfile(
-        "Infineon S25FL512SDSBHV210",
-        bytes.fromhex("01 02 20"),
+        "Micron MT25QL512 (mt25ql512-spi-x1_x2_x4)",
+        bytes.fromhex("20 ba 20"),
         64 * 1024 * 1024,
-        256 * 1024,
-        512,
-        0x1C,
-        0x60,
-    ),
-    FlashProfile(
-        "ISSI IS25LP512M-RHLE",
-        bytes.fromhex("9d 60 1a"),
-        64 * 1024 * 1024,
-        64 * 1024,
-        256,
-        0x3C,
-        0x00,
-    ),
-    FlashProfile(
-        "Micron MT25QL01GBBB8E12-0SIT",
-        bytes.fromhex("20 ba 21"),
-        128 * 1024 * 1024,
         64 * 1024,
         256,
         0x5C,
@@ -242,8 +236,8 @@ class AxiQuadSpi(MappedRegisters):
     def __enter__(self) -> "AxiQuadSpi":
         super().__enter__()
         # With C_USE_STARTUP=1, clock STARTUP before the first software reset.
-        # This transaction follows the AMD driver workaround exactly, including
-        # selecting the flash before loading the transmit FIFO.
+        # This mirrors the AMD standalone-driver workaround: the three bytes
+        # supply dummy clocks while every slave remains deselected.
         self.prime_startup_clock()
         return self
 
@@ -251,7 +245,7 @@ class AxiQuadSpi(MappedRegisters):
         if self.mapping is not None:
             try:
                 self.write32(SPI_CR, SPI_CR_IDLE)
-                self.write32(SPI_SSR, 0xFFFFFFFF)
+                self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
             finally:
                 super().__exit__(exc_type, exc_value, traceback)
         else:
@@ -260,60 +254,50 @@ class AxiQuadSpi(MappedRegisters):
     def reset(self) -> None:
         self.write32(SPI_SRR, SPI_RESET_VALUE)
         time.sleep(0.001)
-        self.write32(
-            SPI_CR,
-            SPI_CR_IDLE | SPI_CR_TX_FIFO_RESET | SPI_CR_RX_FIFO_RESET,
-        )
-        self.write32(SPI_CR, SPI_CR_IDLE)
-        self.write32(SPI_SSR, 0xFFFFFFFF)
+        self.reset_fifos()
+        self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
         pending = self.read32(SPI_IISR)
         if pending:
             self.write32(SPI_IISR, pending)
 
-    def prime_startup_clock(self) -> None:
+    def reset_fifos(self) -> None:
+        """Reset both FIFOs and wait for the self-clearing bits to complete."""
+        reset_mask = SPI_CR_TX_FIFO_RESET | SPI_CR_RX_FIFO_RESET
         self.write32(
             SPI_CR,
-            SPI_CR_IDLE | SPI_CR_TX_FIFO_RESET | SPI_CR_RX_FIFO_RESET,
+            SPI_CR_IDLE | reset_mask,
         )
+        deadline = time.monotonic() + self.timeout
+        while self.read32(SPI_CR) & reset_mask:
+            if time.monotonic() >= deadline:
+                state = self.register_state()
+                raise FlashError(
+                    "timeout waiting for AXI Quad SPI FIFO reset "
+                    f"({self.format_state(state)})"
+                )
         self.write32(SPI_CR, SPI_CR_IDLE)
-        self.write32(SPI_SSR, 0xFFFFFFFF)
+
+    def prime_startup_clock(self) -> None:
+        self.reset_fifos()
+        self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
         pending = self.read32(SPI_IISR)
         if pending:
             self.write32(SPI_IISR, pending)
 
         try:
-            self.write32(SPI_SSR, 0x00000000)
             for value in (CMD_READ_ID, 0x00, 0x00):
                 self.write32(SPI_DTR, value)
+            self.read32(SPI_CR)  # Flush posted FIFO writes.
             self.write32(SPI_CR, SPI_CR_RUN)
-
-            deadline = time.monotonic() + self.timeout
-            while True:
-                status = self.read32(SPI_SR)
-                pending = self.read32(SPI_IISR)
-                if status & SPI_SR_COMMAND_ERROR or pending & SPI_INTR_COMMAND_ERROR:
-                    state = self.register_state()
-                    raise FlashError(
-                        "AXI Quad SPI rejected its STARTUP clock transaction "
-                        f"({self.format_state(state)})"
-                    )
-                if status & SPI_SR_TX_EMPTY:
-                    break
-                if time.monotonic() >= deadline:
-                    state = self.register_state()
-                    raise FlashError(
-                        "timeout priming the AXI Quad SPI STARTUP clock "
-                        f"({self.format_state(state)})"
-                    )
-
+            self.read32(SPI_CR)  # Ensure clocks were enabled before inhibiting.
             self.write32(SPI_CR, SPI_CR_IDLE)
-            for _ in range(SPI_FIFO_DEPTH):
+            for _ in range(2):
                 if self.read32(SPI_SR) & SPI_SR_RX_EMPTY:
                     break
                 self.read32(SPI_DRR)
         finally:
             self.write32(SPI_CR, SPI_CR_IDLE)
-            self.write32(SPI_SSR, 0xFFFFFFFF)
+            self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
             self.reset()
 
     def register_state(self) -> dict[str, int]:
@@ -331,12 +315,8 @@ class AxiQuadSpi(MappedRegisters):
     def transfer(self, transmit: bytes) -> bytes:
         if not 1 <= len(transmit) <= SPI_FIFO_DEPTH:
             raise ValueError(f"SPI transfer must contain 1..{SPI_FIFO_DEPTH} bytes")
-        self.write32(
-            SPI_CR,
-            SPI_CR_IDLE | SPI_CR_TX_FIFO_RESET | SPI_CR_RX_FIFO_RESET,
-        )
-        self.write32(SPI_CR, SPI_CR_IDLE)
-        self.write32(SPI_SSR, 0xFFFFFFFF)
+        self.reset_fifos()
+        self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
         pending = self.read32(SPI_IISR)
         if pending:
             self.write32(SPI_IISR, pending)
@@ -347,7 +327,7 @@ class AxiQuadSpi(MappedRegisters):
         for value in transmit:
             self.write32(SPI_DTR, value)
         self.read32(SPI_CR)  # Flush posted FIFO writes.
-        self.write32(SPI_SSR, 0x00000000)
+        self.write32(SPI_SSR, SPI_SSR_SELECT_FLASH)
         self.write32(SPI_CR, SPI_CR_RUN)
 
         deadline = time.monotonic() + self.timeout
@@ -357,14 +337,14 @@ class AxiQuadSpi(MappedRegisters):
                 self.write32(SPI_CR, SPI_CR_IDLE)
                 state = self.register_state()
                 self.last_transfer_state = state
-                self.write32(SPI_SSR, 0xFFFFFFFF)
+                self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
                 self.write32(SPI_IISR, pending)
                 raise SpiCommandError(transmit[0], state)
             if pending & SPI_INTR_TX_EMPTY:
                 break
             if time.monotonic() >= deadline:
                 self.write32(SPI_CR, SPI_CR_IDLE)
-                self.write32(SPI_SSR, 0xFFFFFFFF)
+                self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
                 state = self.register_state()
                 raise FlashError(
                     "timeout waiting for AXI Quad SPI TX-empty interrupt "
@@ -374,7 +354,7 @@ class AxiQuadSpi(MappedRegisters):
         self.write32(SPI_CR, SPI_CR_IDLE)
         self.last_transfer_state = self.register_state()
         received = bytes(self.read32(SPI_DRR) & 0xFF for _ in transmit)
-        self.write32(SPI_SSR, 0xFFFFFFFF)
+        self.write32(SPI_SSR, SPI_SSR_DESELECT_ALL)
         pending = self.read32(SPI_IISR)
         if pending:
             self.write32(SPI_IISR, pending)
@@ -420,9 +400,7 @@ class SpiNor:
                     f"SPI flash did not respond; JEDEC ID remained "
                     f"{self.jedec_id.hex(' ')} (DQ1 sampled {level}) after "
                     f"STARTUP handoff and safe reset/wake recovery{diagnostic}. "
-                    f"{rejected} Cold-power-cycle the board if the flash was "
-                    "previously left in 4-4-4 QPI mode; the AXI Quad SPI core "
-                    "cannot issue a 4-bit command phase. "
+                    f"{rejected}"
                     f"Supported devices: {supported}"
                 )
             raise FlashError(
@@ -457,7 +435,7 @@ class SpiNor:
 
     def recover_serial_mode(self) -> None:
         """Apply only non-destructive commands accepted by the built core."""
-        # ABh releases Micron/ISSI devices from deep power-down and is also a
+        # ABh releases Micron devices from deep power-down and is also a
         # harmless electronic-signature command on S25FL-S.
         self.try_recovery_command(CMD_RELEASE_POWER_DOWN)
         time.sleep(FLASH_RESET_RECOVERY)
@@ -465,13 +443,22 @@ class SpiNor:
         if self.match_profile(self.jedec_id) is not None:
             return
 
-        # Micron uses F5h to reset quad protocol and 66h/99h for software reset.
-        # A vendor-mismatched dual/quad AXI core can reject these before they
-        # reach the pins, so unsupported commands are recorded and skipped.
+        # Micron uses F5h to leave the 4-4-4 command protocol.  Check the ID
+        # immediately after F5: issuing 66h/99h first would reload NVCR and put
+        # a flash with a bad nonvolatile QPI setting straight back into QPI.
         self.try_recovery_command(CMD_RESET_QUAD_PROTOCOL)
+        time.sleep(FLASH_RESET_RECOVERY)
+        self.jedec_id = self.read_id()
+        if self.match_profile(self.jedec_id) is not None:
+            return
+
+        # A software reset can clear volatile XIP/protocol state.  Follow it
+        # with F5 so a protocol selected by NVCR cannot hide the JEDEC ID again.
         reset_enabled = self.try_recovery_command(CMD_RESET_ENABLE)
         if reset_enabled:
             self.try_recovery_command(CMD_RESET_MEMORY)
+        time.sleep(FLASH_RESET_RECOVERY)
+        self.try_recovery_command(CMD_RESET_QUAD_PROTOCOL)
         time.sleep(FLASH_RESET_RECOVERY)
         self.jedec_id = self.read_id()
         if self.match_profile(self.jedec_id) is not None:
@@ -494,6 +481,58 @@ class SpiNor:
 
     def read_status(self) -> int:
         return self.spi.transfer(bytes([CMD_READ_STATUS, 0]))[1]
+
+    def is_micron(self) -> bool:
+        return self.profile.jedec_prefix == bytes.fromhex("20 ba 20")
+
+    def read_micron_nvcr(self) -> int:
+        if not self.is_micron():
+            raise FlashError("NVCR boot-mode repair applies only to Micron MT25Q")
+        response = self.spi.transfer(
+            bytes([CMD_READ_NONVOLATILE_CONFIG, 0, 0])
+        )
+        # MT25Q returns the 16-bit register least-significant byte first.
+        return response[1] | (response[2] << 8)
+
+    @staticmethod
+    def micron_nvcr_boot_safe(value: int) -> bool:
+        return (value & MICRON_NVCR_BOOT_SAFE_MASK) == MICRON_NVCR_BOOT_SAFE_MASK
+
+    def repair_micron_boot_mode(self) -> tuple[int, int]:
+        """Persist an extended-SPI, non-XIP, three-byte-address boot state."""
+        before = self.read_micron_nvcr()
+        after = before | MICRON_NVCR_BOOT_SAFE_MASK
+        if after != before:
+            self.write_enable()
+            self.spi.transfer(
+                bytes(
+                    [
+                        CMD_WRITE_NONVOLATILE_CONFIG,
+                        after & 0xFF,
+                        (after >> 8) & 0xFF,
+                    ]
+                )
+            )
+            self.wait_ready(10.0, "Micron nonvolatile configuration write")
+            observed = self.read_micron_nvcr()
+            if observed != after:
+                raise FlashError(
+                    "Micron NVCR verification failed: "
+                    f"read 0x{observed:04x}, expected 0x{after:04x}"
+                )
+
+        # Reload the repaired NVCR and prove that ordinary 1-1-1 identification
+        # still works after the reset which previously restored QPI.
+        self.spi.transfer(bytes([CMD_RESET_ENABLE]))
+        self.spi.transfer(bytes([CMD_RESET_MEMORY]))
+        time.sleep(FLASH_RESET_RECOVERY)
+        self.jedec_id = self.read_id()
+        if self.match_profile(self.jedec_id) != self.profile:
+            raise FlashError(
+                "Micron did not return to extended SPI after repaired NVCR "
+                f"reload; JEDEC ID is {self.jedec_id.hex(' ')}"
+            )
+        return before, after
 
     def address(self, value: int) -> bytes:
         maximum = (1 << (8 * self.profile.address_bytes)) - 1
@@ -778,7 +817,7 @@ def load_image(path: Path, expected_part: str | None) -> tuple[bytes, dict[str, 
 
 def flash_record(flash: SpiNor) -> dict[str, object]:
     status = flash.read_status()
-    return {
+    record: dict[str, object] = {
         "jedec_id": flash.jedec_id.hex(" "),
         "profile": flash.profile.name,
         "physical_capacity": flash.physical_capacity,
@@ -789,6 +828,11 @@ def flash_record(flash: SpiNor) -> dict[str, object]:
         "block_protected": bool(status & flash.profile.block_protect_mask),
         "operation_error": bool(status & flash.profile.operation_error_mask),
     }
+    if getattr(flash, "is_micron", lambda: False)():
+        nvcr = flash.read_micron_nvcr()
+        record["nvcr"] = nvcr
+        record["boot_mode_safe"] = flash.micron_nvcr_boot_safe(nvcr)
+    return record
 
 
 def display_flash(record: dict[str, object]) -> None:
@@ -803,6 +847,16 @@ def display_flash(record: dict[str, object]) -> None:
         "write protect:   "
         + ("block-protect bits are set" if record["block_protected"] else "clear")
     )
+    if "nvcr" in record:
+        print(f"Micron NVCR:     0x{int(record['nvcr']):04x}")
+        print(
+            "cold-boot mode:  "
+            + (
+                "extended SPI / non-XIP / 3-byte address"
+                if record["boot_mode_safe"]
+                else "UNSAFE; run --repair-micron-boot-mode --yes"
+            )
+        )
 
 
 def require_writable(flash: SpiNor) -> None:
@@ -1014,6 +1068,14 @@ def parse_args() -> argparse.Namespace:
         metavar="IMAGE",
         help="compare flash to IMAGE without writing",
     )
+    actions.add_argument(
+        "--repair-micron-boot-mode",
+        action="store_true",
+        help=(
+            "repair Micron NVCR to extended SPI/non-XIP/3-byte cold-boot "
+            "defaults; requires a Quad+Micron AXI Quad SPI recovery image"
+        ),
+    )
     parser.add_argument(
         "--reload",
         action="store_true",
@@ -1108,8 +1170,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    require_root()
     args = parse_args()
+    require_root()
     if args.qspi_base < 0 or args.qspi_base % 4:
         raise FlashError("--qspi-base must be a nonnegative aligned offset")
     if args.hwicap_base < 0 or args.hwicap_base % 4:
@@ -1125,7 +1187,12 @@ def main() -> int:
     if args.device_index < 0 or args.wait <= 0:
         raise FlashError("device index must be nonnegative and wait must be positive")
 
-    secondary_action = args.status or args.read is not None or args.validate is not None
+    secondary_action = (
+        args.status
+        or args.read is not None
+        or args.validate is not None
+        or args.repair_micron_boot_mode
+    )
     if secondary_action and args.image is not None:
         raise FlashError(
             "positional IMAGE cannot be combined with status/read/validate"
@@ -1138,11 +1205,17 @@ def main() -> int:
         raise FlashError("--force is valid only with --read")
     if args.json and not args.status:
         raise FlashError("--json is valid only with --status")
+    if args.repair_micron_boot_mode and not args.yes:
+        raise FlashError(
+            "refusing to change Micron nonvolatile configuration without "
+            "--yes"
+        )
     if args.reload and secondary_action:
         raise FlashError("--reload cannot be combined with status/read/validate")
     if not secondary_action and args.image is None and not args.reload:
         raise FlashError(
-            "select --status, --read, --validate, provide IMAGE, or use --reload"
+            "select --status, --read, --validate, "
+            "--repair-micron-boot-mode, provide IMAGE, or use --reload"
         )
     if args.boot_address is None:
         args.boot_address = args.offset if args.image is not None else 0
@@ -1175,6 +1248,14 @@ def main() -> int:
                 display_flash(record)
 
             if args.status:
+                return 0
+            if args.repair_micron_boot_mode:
+                before, after = flash.repair_micron_boot_mode()
+                print(f"Micron NVCR:     0x{before:04x} -> 0x{after:04x}")
+                print(
+                    "Micron cold-boot protocol repaired and verified after "
+                    "software reset"
+                )
                 return 0
             if args.read is not None:
                 output = args.read.expanduser()

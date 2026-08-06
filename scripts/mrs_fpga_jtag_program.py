@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Program volatile FPGA SRAM through a physical USB-JTAG adapter.
+"""Program FPGA SRAM or SPI configuration flash through physical USB-JTAG.
 
-Persistent flash is never modified.  When a PCIe endpoint is selected, it is
-removed before whole-device configuration and recovered afterward with the
-companion mrs_fpga_pcie_xdma.py implementation.
+The default operation remains volatile SRAM programming.  ``--flash --yes``
+loads an SPI-over-JTAG bridge, detects the attached board flash, persistently
+writes and verifies it, then lets the FPGA reload from flash.  PCIe is not
+required.  The optional ``--reload`` mode removes a currently visible endpoint
+before either operation and recovers PCIe/XDMA afterward with the companion
+mrs_fpga_pcie_xdma.py implementation.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import mrs_fpga_pcie_xdma as pcie
 
@@ -26,6 +30,28 @@ class JtagError(RuntimeError):
 
 
 IDCODE_PATTERN = re.compile(r"\bidcode\s+(0x[0-9a-fA-F]+)\b", re.IGNORECASE)
+XADC_TEMPERATURE_PATTERN = re.compile(
+    r'"temp"\s*:\s*(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)'
+)
+FLASH_DETAIL_PATTERN = re.compile(
+    r"Jedec ID\s*:\s*([0-9a-fA-F]{2}).*?"
+    r"memory type\s*:\s*([0-9a-fA-F]{2}).*?"
+    r"memory capacity\s*:\s*([0-9a-fA-F]{2})",
+    re.IGNORECASE | re.DOTALL,
+)
+
+SUPPORTED_FLASHES = {
+    bytes.fromhex("01 02 19"): (
+        "NiteFury",
+        "Spansion/Cypress S25FL256S",
+        32 * 1024 * 1024,
+    ),
+    bytes.fromhex("20 ba 20"): (
+        "Aller",
+        "Micron MT25QL512",
+        64 * 1024 * 1024,
+    ),
+}
 
 
 def require_root() -> None:
@@ -95,6 +121,95 @@ def validate_idcode(idcode: int, expected: int | None, mask: int) -> None:
     print(f"IDCODE check:    passed (mask 0x{mask:08x})")
 
 
+def parse_xadc_temperature(output: str) -> float | None:
+    match = XADC_TEMPERATURE_PATTERN.search(output)
+    return float(match.group(1)) if match else None
+
+
+def report_xadc_temperature(args: argparse.Namespace) -> float | None:
+    """Read XADC through JTAG, but do not block programming if unavailable."""
+    command = [*loader_base_command(args), "--read_xadc"]
+    try:
+        completed = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+    except FileNotFoundError as error:
+        raise JtagError(f"required command was not found: {args.loader}") from error
+
+    output = completed.stdout.replace(b"\x00", b"").decode("utf-8", errors="replace")
+    temperature = parse_xadc_temperature(output)
+    if completed.returncode or temperature is None:
+        detail = f"loader status {completed.returncode}"
+        if completed.returncode == 0:
+            detail = "temperature was absent from loader output"
+        print(f"WARNING: XADC temperature unavailable ({detail})", file=sys.stderr)
+        return None
+    print(f"XADC temperature: {temperature:.3f} degC")
+    return temperature
+
+
+def parse_flash_jedec(output: str) -> bytes | None:
+    """Parse both known-model and generic-detail openFPGALoader output."""
+    lowered = output.lower()
+    if "s25fl256s" in lowered:
+        return bytes.fromhex("01 02 19")
+    if "mt25ql512" in lowered or "n25q512" in lowered:
+        return bytes.fromhex("20 ba 20")
+    match = FLASH_DETAIL_PATTERN.search(output)
+    if match:
+        return bytes(int(value, 16) for value in match.groups())
+    return None
+
+
+def detect_flash_over_jtag(
+    args: argparse.Namespace,
+) -> tuple[bytes, str, str, int]:
+    """Load the bridge and read one byte so JEDEC is known before any erase."""
+    with tempfile.TemporaryDirectory(prefix="mrs-fpga-jtag-flash-") as directory:
+        probe = Path(directory, "probe.bin")
+        command = [
+            *loader_base_command(args),
+            "--fpga-part",
+            args.fpga_part,
+            "--offset",
+            "0",
+            "--dump-flash",
+            "--file-size",
+            "1",
+            str(probe),
+        ]
+        completed = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+
+    output = completed.stdout.replace(b"\x00", b"").decode("utf-8", errors="replace")
+    print(output, end="" if output.endswith("\n") else "\n")
+    if completed.returncode:
+        raise JtagError(
+            "read-only SPI-over-JTAG flash detection failed with status "
+            f"{completed.returncode}"
+        )
+
+    jedec = parse_flash_jedec(output)
+    if jedec is None:
+        raise JtagError("SPI-over-JTAG probe did not report a usable JEDEC ID")
+    profile = SUPPORTED_FLASHES.get(jedec)
+    if profile is None:
+        supported = ", ".join(
+            f"{key.hex(' ')} ({value[1]})" for key, value in SUPPORTED_FLASHES.items()
+        )
+        raise JtagError(
+            f"unsupported board flash JEDEC ID {jedec.hex(' ')}; "
+            f"supported parts: {supported}"
+        )
+    board, model, capacity = profile
+    print(f"flash JEDEC ID:   {jedec.hex(' ')}")
+    print(f"flash:            {model}")
+    print(f"board profile:    {board}")
+    print(f"flash capacity:   {capacity // (1024 * 1024)} MiB")
+    return jedec, board, model, capacity
+
+
 def infer_image_type(path: Path, override: str | None) -> str:
     if override:
         return override
@@ -117,9 +232,14 @@ def parse_expected_idcode(value: str) -> int | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Program volatile FPGA SRAM through physical USB-JTAG; persistent "
-            "flash is unchanged"
-        )
+            "Program FPGA SRAM or supported board SPI flash through physical "
+            "USB-JTAG and report XADC temperature"
+        ),
+        epilog=(
+            "SRAM: IMAGE.bit. Persistent flash: IMAGE.bit --flash --yes. "
+            "Supported flash profiles are NiteFury S25FL256S and Aller "
+            "MT25QL512; writes are verified."
+        ),
     )
     parser.add_argument(
         "image", nargs="?", type=existing_file, help=".bit or .bin image"
@@ -148,6 +268,30 @@ def parse_args() -> argparse.Namespace:
         "--file-type", choices=("bit", "bin"), help="override image type"
     )
     parser.add_argument(
+        "--flash",
+        action="store_true",
+        help="detect, write, and verify the board SPI flash through JTAG",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm the persistent erase/program operation required by --flash",
+    )
+    parser.add_argument(
+        "--offset",
+        type=integer,
+        default=0,
+        help="flash byte offset (default: 0)",
+    )
+    parser.add_argument(
+        "--fpga-part",
+        default="xc7a200tfbg484",
+        help=(
+            "FPGA model/package selecting the SPI-over-JTAG bridge "
+            "(default: xc7a200tfbg484 for Aller and NiteFury)"
+        ),
+    )
+    parser.add_argument(
         "--expected-idcode",
         type=parse_expected_idcode,
         default=0x03636093,
@@ -160,9 +304,9 @@ def parse_args() -> argparse.Namespace:
         help="IDCODE comparison mask (default: 0x0fffffff)",
     )
     parser.add_argument(
-        "--no-pcie-recovery",
+        "--reload",
         action="store_true",
-        help="do not remove/re-enumerate a PCIe endpoint",
+        help="cleanly remove a visible PCIe endpoint and recover PCIe/XDMA afterward",
     )
     parser.add_argument("--bdf", help="PCI BDF to save and recover")
     parser.add_argument(
@@ -194,8 +338,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    require_root()
     args = parse_args()
+    require_root()
     if args.frequency <= 0:
         raise JtagError("--frequency must be positive")
     if not 0 <= args.idcode_mask <= 0xFFFFFFFF:
@@ -206,15 +350,28 @@ def main() -> int:
         raise JtagError("--device-index must be nonnegative")
     if args.wait <= 0:
         raise JtagError("--wait must be positive")
+    if args.offset < 0:
+        raise JtagError("--offset must be nonnegative")
+    if not args.fpga_part:
+        raise JtagError("--fpga-part must not be empty")
     if shutil.which(args.loader) is None:
         raise JtagError(f"required command was not found: {args.loader}")
     if not args.detect and args.image is None:
         raise JtagError("provide IMAGE or use --detect")
     if args.detect and args.image is not None:
         raise JtagError("--detect does not accept IMAGE")
+    if args.flash and args.image is None:
+        raise JtagError("--flash requires IMAGE")
+    if args.flash and not args.yes:
+        raise JtagError("refusing to erase/program persistent flash without --yes")
+    if args.yes and not args.flash:
+        raise JtagError("--yes is valid only with --flash")
+    if args.offset and not args.flash:
+        raise JtagError("--offset is valid only with --flash")
 
     idcode, _ = run_detection(args)
     validate_idcode(idcode, args.expected_idcode, args.idcode_mask)
+    report_xadc_temperature(args)
     if args.detect:
         print("physical USB-JTAG detection passed")
         return 0
@@ -230,16 +387,25 @@ def main() -> int:
     print(f"JTAG frequency:  {args.frequency} Hz")
     if args.serial:
         print(f"JTAG serial:     {args.serial}")
-    print("persistent QSPI: unchanged")
+    if args.flash:
+        print(f"flash offset:     0x{args.offset:x}")
+        print(f"FPGA/package:     {args.fpga_part}")
+        print("persistent QSPI: detect, erase/program, and verify over JTAG")
+    else:
+        print("persistent QSPI: unchanged")
 
     selected_bdf: str | None = None
-    vendor_id = pcie.parse_hex_id(args.vendor_id, "vendor ID")
-    device_id = pcie.parse_hex_id(args.device_id, "device ID")
-    required_nodes = pcie.parse_required_nodes(args.required_nodes)
-    module_args = shlex.split(args.module_args)
+    vendor_id: int | None = None
+    device_id: int | None = None
+    required_nodes: list[str] = []
+    module_args: list[str] = []
 
-    if not args.no_pcie_recovery:
-        selected_bdf = pcie.detect_bdf(
+    if args.reload:
+        vendor_id = pcie.parse_hex_id(args.vendor_id, "vendor ID")
+        device_id = pcie.parse_hex_id(args.device_id, "device ID")
+        required_nodes = pcie.parse_required_nodes(args.required_nodes)
+        module_args = shlex.split(args.module_args)
+        selected_bdf = pcie.find_current_bdf(
             explicit=args.bdf,
             device_index=args.device_index,
             vendor_id=vendor_id,
@@ -247,31 +413,56 @@ def main() -> int:
             module=args.module,
             allow_absent_explicit=bool(args.bdf),
         )
-        print(f"PCI endpoint:    {selected_bdf}")
-        path = pcie.endpoint_path(selected_bdf)
-        if path.exists():
-            print("removing the live PCI endpoint before whole-device configuration")
-            pcie.reload_xdma(
-                mode="remove",
-                bdf=selected_bdf,
-                device_index=args.device_index,
-                module=args.module,
-                module_args=module_args,
-                required_nodes=[],
-                timeout=args.wait,
-                device_mode=args.device_mode,
-            )
+        if selected_bdf is None:
+            selected_bdf = pcie.read_saved_bdf(args.device_index)
+        if selected_bdf is not None:
+            print(f"PCI endpoint:    {selected_bdf}")
+            path = pcie.endpoint_path(selected_bdf)
+            if path.exists():
+                print(
+                    "removing the live PCI endpoint before whole-device configuration"
+                )
+                pcie.reload_xdma(
+                    mode="remove",
+                    bdf=selected_bdf,
+                    device_index=args.device_index,
+                    module=args.module,
+                    module_args=module_args,
+                    required_nodes=[],
+                    timeout=args.wait,
+                    device_mode=args.device_mode,
+                )
+            else:
+                print("PCI endpoint is absent; recovery will rescan after programming")
         else:
-            print("PCI endpoint is already absent; using the saved BDF for recovery")
+            print("PCI endpoint:    not visible; recovery will auto-discover it")
 
-    command = [
-        *loader_base_command(args),
-        "--file-type",
-        image_type,
-        "--write-sram",
-        str(args.image),
-    ]
-    print("programming volatile FPGA SRAM through physical USB-JTAG")
+    if args.flash:
+        _, _, _, capacity = detect_flash_over_jtag(args)
+        image_end = args.offset + args.image.stat().st_size
+        if image_end > capacity:
+            raise JtagError(
+                f"image end 0x{image_end:x} exceeds detected flash capacity "
+                f"0x{capacity:x}"
+            )
+
+    command = [*loader_base_command(args), "--file-type", image_type]
+    if args.flash:
+        command.extend(
+            [
+                "--fpga-part",
+                args.fpga_part,
+                "--offset",
+                str(args.offset),
+                "--write-flash",
+                "--verify",
+                str(args.image),
+            ]
+        )
+        print("programming detected board SPI flash through physical USB-JTAG")
+    else:
+        command.extend(["--write-sram", str(args.image)])
+        print("programming volatile FPGA SRAM through physical USB-JTAG")
     try:
         subprocess.run(command, check=True)
     except subprocess.CalledProcessError as error:
@@ -287,20 +478,28 @@ def main() -> int:
             f"JTAG programming failed with status {error.returncode}"
         ) from error
 
-    if selected_bdf:
-        pcie.reload_xdma(
-            mode="post-reconfigure",
-            bdf=selected_bdf,
+    if args.reload:
+        assert vendor_id is not None
+        recovered_bdf = pcie.recover_missing_endpoint(
+            preferred_bdf=selected_bdf,
+            strict_bdf=bool(args.bdf),
             device_index=args.device_index,
+            vendor_id=vendor_id,
+            device_id=device_id,
             module=args.module,
             module_args=module_args,
             required_nodes=required_nodes,
             timeout=args.wait,
             device_mode=args.device_mode,
+            unload_first=True,
         )
-        print("FPGA programmed and PCIe/XDMA recovered successfully")
+        pcie.remember_bdf(args.device_index, recovered_bdf)
+        target = "SPI flash" if args.flash else "FPGA"
+        print(f"{target} programmed and PCIe/XDMA recovered successfully")
     else:
-        print("FPGA programmed successfully; PCIe recovery was disabled")
+        target = "SPI flash" if args.flash else "FPGA"
+        print(f"{target} programmed successfully through USB-JTAG")
+        print("PCIe/XDMA was not inspected; add --reload to recover it automatically")
     return 0
 
 
