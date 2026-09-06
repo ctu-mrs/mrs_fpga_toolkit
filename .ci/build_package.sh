@@ -1,12 +1,8 @@
 #!/bin/bash
+# expects ARTIFACTS_FOLDER path as the first argument ($1)
 
-# Build every Debian artifact from a stable repository-relative location.
+# build all artifacts
 set -euo pipefail
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 ARTIFACTS_DIRECTORY" >&2
-  exit 2
-fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
@@ -26,12 +22,10 @@ echo "$0: building the development and control-utility packages"
 "$SCRIPT_DIR/build_package_dev.sh"
 "$SCRIPT_DIR/build_package_fpgactl.sh"
 
-# Leave artifacts in place when the requested directory is the repository
-# root; otherwise move the complete package set to the CI collection folder.
 if [[ "$ARTIFACTS_FOLDER" != "$REPOSITORY_ROOT" ]]; then
   packages=("$REPOSITORY_ROOT"/*.deb)
   if [[ ! -e "${packages[0]}" ]]; then
-    echo "no Debian packages were produced" >&2
+    echo "$0: no Debian packages were produced" >&2
     exit 1
   fi
   mv -- "${packages[@]}" "$ARTIFACTS_FOLDER/"
