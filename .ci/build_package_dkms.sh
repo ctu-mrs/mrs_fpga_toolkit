@@ -1,5 +1,7 @@
 #!/bin/bash
-set -e ; # terminate the script if any command fails
+
+# Build a source-only DKMS package from one immutable upstream XDMA revision.
+set -euo pipefail
 
 # check if the script is run as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -8,14 +10,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # load the architecture string - cross-platform compatible
-ARCH="all" ;
+ARCH="all"
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 ###################################
 ### CONFIGURATION SECTION START ###
 ###################################
 
-XDMA_VERSION="2025.2" ;
-XDMA_COMMIT="8721136" ;
+XDMA_VERSION="2025.2"
+XDMA_COMMIT="8721136e74a66500b02d16cb41922d966139cd46"
 
 # custom package name
 PACKAGE_NAME="mrs-fpga-dkms" ;
@@ -24,7 +29,8 @@ PACKAGE_NAME="mrs-fpga-dkms" ;
 PACKAGE_DESCRIPTION="Xilinx XDMA DKMS for MRS UAV system" ;
 
 # the final package name
-PACKAGE_FILENAME=$PACKAGE_NAME"_"$XDMA_VERSION"_"$ARCH".deb" ;
+PACKAGE_FILENAME="${PACKAGE_NAME}_${XDMA_VERSION}_${ARCH}.deb"
+PACKAGE_FILE="$REPOSITORY_ROOT/$PACKAGE_FILENAME"
 
 # package metadata
 PACKAGE_MAINTAINER="Vojtech Vrba <vrba.vojtech@fel.cvut.cz>" ;
@@ -35,27 +41,39 @@ PACKAGE_DEPENDS="linux-headers-generic, dkms, udev, build-essential" ;
 ###################################
 
 # stage installation into a package root
-PACKAGE_ROOT=$(mktemp -d) ;
-mkdir -p "$PACKAGE_ROOT/DEBIAN" ;
+WORK_ROOT=$(mktemp -d -t mrs-fpga-dkms-build-XXXXXXXX)
+SOURCE_ROOT="$WORK_ROOT/dma_ip_drivers"
+PACKAGE_ROOT="$WORK_ROOT/package"
+
+cleanup() {
+    rm -rf -- "$WORK_ROOT"
+}
+trap cleanup EXIT
+
+mkdir -p "$PACKAGE_ROOT/DEBIAN"
 
 # install prerequisites
-apt-get -y update ;
-apt-get -y install git debhelper ;
+apt-get -y update
+apt-get -y install git debhelper
 
-# clone the XDMA driver sources and checkout the specified commit
-git clone https://github.com/Xilinx/dma_ip_drivers.git --depth 1 ;
+git init --quiet "$SOURCE_ROOT"
+git -C "$SOURCE_ROOT" remote add origin https://github.com/Xilinx/dma_ip_drivers.git
+git -C "$SOURCE_ROOT" fetch --depth 1 origin "$XDMA_COMMIT"
+git -C "$SOURCE_ROOT" checkout --quiet --detach FETCH_HEAD
 
-cd dma_ip_drivers ;
-git checkout $XDMA_COMMIT ;
-cd .. ;
+RESOLVED_XDMA_COMMIT=$(git -C "$SOURCE_ROOT" rev-parse HEAD)
+if [[ "$RESOLVED_XDMA_COMMIT" != "$XDMA_COMMIT" ]]; then
+    echo "XDMA source verification failed: expected $XDMA_COMMIT, got $RESOLVED_XDMA_COMMIT" >&2
+    exit 1
+fi
 
 # create directory for XDMA DKMS sources
 XDMA_USR_SRC="/usr/src/xdma-$XDMA_VERSION" ;
 mkdir -p "$PACKAGE_ROOT/$XDMA_USR_SRC" ;
 
 # copy the XDMA driver sources
-cp dma_ip_drivers/XDMA/linux-kernel/xdma/* $PACKAGE_ROOT/$XDMA_USR_SRC/ ;
-cp dma_ip_drivers/XDMA/linux-kernel/include/libxdma_api.h $PACKAGE_ROOT/$XDMA_USR_SRC/ ;
+cp "$SOURCE_ROOT"/XDMA/linux-kernel/xdma/* "$PACKAGE_ROOT/$XDMA_USR_SRC/"
+cp "$SOURCE_ROOT/XDMA/linux-kernel/include/libxdma_api.h" "$PACKAGE_ROOT/$XDMA_USR_SRC/"
 
 # create the DKMS configuration file
 cat <<EOF >>$PACKAGE_ROOT/$XDMA_USR_SRC/dkms.conf
@@ -76,9 +94,6 @@ chmod 644 $PACKAGE_ROOT/etc/modules-load.d/xdma.conf ;
 mkdir -p "$PACKAGE_ROOT/etc/udev/rules.d" ;
 echo 'KERNEL=="xdma*" MODE="0777"' | tee $PACKAGE_ROOT/etc/udev/rules.d/60-xdma.rules ;
 chmod 644 $PACKAGE_ROOT/etc/udev/rules.d/60-xdma.rules ;
-
-# remove the repo dir
-rm -rf dma_ip_drivers ;
 
 # create package control file
 cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOT
@@ -174,18 +189,18 @@ EOF
 chmod +x "$PACKAGE_ROOT/DEBIAN/postrm" ;
 
 # create the new deb package
-dpkg-deb --build "$PACKAGE_ROOT" "$PACKAGE_FILENAME" ;
+dpkg-deb --root-owner-group --build "$PACKAGE_ROOT" "$PACKAGE_FILE"
 
 # create a world-readable copy outside private home directories for apt validation
 if [ -d /var/tmp ] ; then
-    cp ./$PACKAGE_FILENAME /var/tmp/$PACKAGE_FILENAME ;
-    chmod 644 /var/tmp/$PACKAGE_FILENAME ;
+    cp "$PACKAGE_FILE" "/var/tmp/$PACKAGE_FILENAME"
+    chmod 644 "/var/tmp/$PACKAGE_FILENAME"
 fi
 
 echo "" ;
 echo "###### FINISHED PACKAGE INFO START ######" ;
-stat ./$PACKAGE_FILENAME ;
-dpkg-deb --info ./$PACKAGE_FILENAME ;
+stat "$PACKAGE_FILE"
+dpkg-deb --info "$PACKAGE_FILE"
 if [ -f /var/tmp/$PACKAGE_FILENAME ] ; then
     echo "APT validation copy: /var/tmp/$PACKAGE_FILENAME" ;
 fi
