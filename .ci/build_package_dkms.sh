@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Build a source-only DKMS package from one immutable upstream XDMA revision.
 set -euo pipefail
 
 if [[ $(id -u) != 0 ]]; then
@@ -8,13 +7,14 @@ if [[ $(id -u) != 0 ]]; then
     exit 1
 fi
 
+# main paths
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
+# package configuration
 ARCH="all"
 XDMA_VERSION="2025.2"
 XDMA_COMMIT="b8466090b4e812e191da9e9305ffb11cb7ace768"
-# Keep the public package version equal to the upstream module version.
 PACKAGE_VERSION="${DKMS_PACKAGE_VERSION:-$XDMA_VERSION}"
 dpkg --validate-version "$PACKAGE_VERSION"
 PACKAGE_NAME="mrs-fpga-dkms"
@@ -27,11 +27,14 @@ PACKAGE_ROOT="$WORK_ROOT/package"
 trap 'rm -rf -- "$WORK_ROOT"' EXIT
 mkdir -p "$PACKAGE_ROOT/DEBIAN"
 
+# prepare apt
 apt-get -y update
 apt-get -y install git debhelper
-# Select tracking packages for the target distribution, never the CI host's uname.
-HEADER_DEPENDS=$("$SCRIPT_DIR/dkms/header_depends.sh")
 
+# install target distribution kernel headers
+HEADER_DEPENDS=$("$SCRIPT_DIR/package_dkms/header_depends.sh")
+
+# clone XDMA repo
 git init --quiet "$SOURCE_ROOT"
 git -C "$SOURCE_ROOT" remote add origin https://github.com/Xilinx/dma_ip_drivers.git
 git -C "$SOURCE_ROOT" fetch --depth 1 origin "$XDMA_COMMIT"
@@ -42,6 +45,7 @@ if [[ "$RESOLVED_XDMA_COMMIT" != "$XDMA_COMMIT" ]]; then
     exit 1
 fi
 
+# add XDMA sources to package and DKMS
 XDMA_USR_SRC="/usr/src/xdma-$XDMA_VERSION"
 mkdir -p "$PACKAGE_ROOT$XDMA_USR_SRC"
 cp "$SOURCE_ROOT"/XDMA/linux-kernel/xdma/* "$PACKAGE_ROOT$XDMA_USR_SRC/"
@@ -55,11 +59,13 @@ AUTOINSTALL="yes"
 EOF
 chmod 644 "$PACKAGE_ROOT$XDMA_USR_SRC/dkms.conf"
 
+# add udev rules and modules-load configuration
 mkdir -p "$PACKAGE_ROOT/etc/modules-load.d" "$PACKAGE_ROOT/etc/udev/rules.d"
 echo xdma > "$PACKAGE_ROOT/etc/modules-load.d/xdma.conf"
 echo 'KERNEL=="xdma*" MODE="0777"' > "$PACKAGE_ROOT/etc/udev/rules.d/60-xdma.rules"
 chmod 644 "$PACKAGE_ROOT/etc/modules-load.d/xdma.conf" "$PACKAGE_ROOT/etc/udev/rules.d/60-xdma.rules"
 
+# package control file
 cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOF
 Package: $PACKAGE_NAME
 Version: $PACKAGE_VERSION
@@ -71,8 +77,9 @@ Depends: dkms (>= 2.1.0.0), $HEADER_DEPENDS, udev, build-essential
 Description: Xilinx XDMA DKMS for MRS UAV system
 EOF
 
+# add package scripts
 for script in postinst prerm postrm; do
-    sed "s/@XDMA_VERSION@/$XDMA_VERSION/g" "$SCRIPT_DIR/dkms/$script.in" > "$PACKAGE_ROOT/DEBIAN/$script"
+    sed "s/@XDMA_VERSION@/$XDMA_VERSION/g" "$SCRIPT_DIR/package_dkms/$script.sh" > "$PACKAGE_ROOT/DEBIAN/$script"
     chmod 755 "$PACKAGE_ROOT/DEBIAN/$script"
 done
 find "$PACKAGE_ROOT/etc" -type f | sed "s#^$PACKAGE_ROOT##" | sort > "$PACKAGE_ROOT/DEBIAN/conffiles"
@@ -81,6 +88,7 @@ find "$PACKAGE_ROOT/etc" -type f | sed "s#^$PACKAGE_ROOT##" | sort > "$PACKAGE_R
     find . -type f ! -path './DEBIAN/*' -print0 | xargs -0 md5sum > ./DEBIAN/md5sums
 )
 
+# build package
 dpkg-deb --root-owner-group --build "$PACKAGE_ROOT" "$PACKAGE_FILE"
 if [[ -d /var/tmp ]]; then
     cp "$PACKAGE_FILE" "/var/tmp/$PACKAGE_FILENAME"
