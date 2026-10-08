@@ -193,6 +193,37 @@ std::string inferImageType(
     throw Error("cannot infer image type; use --file-type bit or --file-type bin");
 }
 
+/** Reject incomplete uploads before the loader can touch FPGA configuration. */
+void validateBitImage(const std::filesystem::path& image) {
+    const auto bytes = readBinary(image);
+    std::size_t position = 0;
+    const auto readLength = [&](std::size_t count) {
+        if (count > bytes.size() - position) throw Error("truncated bitstream header");
+        std::uint32_t value = 0;
+        for (std::size_t i = 0; i < count; ++i) value = (value << 8) | bytes[position++];
+        return value;
+    };
+    const auto skip = [&](std::size_t count) {
+        if (count > bytes.size() - position) throw Error("truncated bitstream header");
+        position += count;
+    };
+    skip(readLength(2));
+    if (readLength(2) != 1) throw Error("invalid bitstream field marker length");
+    for (char field : std::string("abcde")) {
+        if (position == bytes.size() || bytes[position++] != field) {
+            throw Error("invalid bitstream header field");
+        }
+        const auto count = readLength(field == 'e' ? 4 : 2);
+        if (field == 'e') {
+            if (count == 0 || count != bytes.size() - position) {
+                throw Error("bitstream payload length does not match the complete image file");
+            }
+            return;
+        }
+        skip(count);
+    }
+}
+
 }  // namespace
 
 int runJtag(const JtagCommand& options) {
@@ -209,9 +240,9 @@ int runJtag(const JtagCommand& options) {
         throw Error("required JTAG loader was not found: " + options.loader);
     }
     requireRoot();
-    (void)detectTarget(options);
-    reportTemperature(options);
     if (options.action == JtagAction::show) {
+        (void)detectTarget(options);
+        reportTemperature(options);
         std::cout << "physical USB-JTAG detection passed\n";
         return 0;
     }
@@ -226,6 +257,10 @@ int runJtag(const JtagCommand& options) {
     }
     const std::string image_type = inferImageType(image, options.file_type);
     const std::uint64_t image_size = std::filesystem::file_size(image);
+    if (image_size == 0) throw Error("image file is empty");
+    if (image_type == "bit") validateBitImage(image);
+    (void)detectTarget(options);
+    reportTemperature(options);
     std::cout << "image:           " << std::filesystem::absolute(image) << '\n'
               << "image type:      " << image_type << '\n'
               << "image bytes:     " << image_size << '\n'
@@ -272,6 +307,12 @@ int runJtag(const JtagCommand& options) {
     if (programmed.exit_code != 0) {
         throw Error("JTAG programming failed with status " +
                     std::to_string(programmed.exit_code));
+    }
+    // Some openFPGALoader versions print a parse/program FAIL and return zero.
+    // A reported failure must never become a successful fpgactl operation.
+    if (std::regex_search(programmed.output,
+            std::regex(R"((^|[\r\n])[ \t]*FAIL([\r\n]|$))"))) {
+        throw Error("JTAG loader reported FAIL despite exit status zero");
     }
 
     if (options.reload) {
